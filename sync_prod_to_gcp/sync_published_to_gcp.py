@@ -66,17 +66,18 @@ ENSURE_HOSTS = [
     #('web2.arxiv.org', 40),
     #('web3.arxiv.org', 40),
     #('web4.arxiv.org', 40),
-    ('web5.arxiv.org', 8),
-    ('web6.arxiv.org', 8),
-    ('web7.arxiv.org', 8),
-    ('web8.arxiv.org', 8),
-    ('web9.arxiv.org', 8),
+    ('web5.arxiv.org', 4),
+    ('web6.arxiv.org', 4),
+    ('web7.arxiv.org', 4),
+    ('web8.arxiv.org', 4),
+    ('web9.arxiv.org', 4),
+    ('web10.arxiv.org', 4),
 ]
 """Tuples of form HOST, THREADS_FOR_HOST"""
 
 ENSURE_CERT_VERIFY=False
 
-PDF_WAIT_SEC = 60 * 3
+PDF_WAIT_SEC = 60 * 10
 """Maximum sec to wait for a PDF to be created"""
 
 todo_q: Queue = Queue()
@@ -250,7 +251,7 @@ def ensure_pdf(session, host, arxiv_id):
 
     def arxiv_pdf_url(host, arxiv_id) -> str:
         """Gets the URL that would be used to request the pdf for the arxiv_id"""
-        return f"https://{host}/pdf/{arxiv_id.filename}v{arxiv_id.version}.pdf"
+        return f"https://{host}/pdf/{arxiv_id.filename}v{arxiv_id.version}.pdf?nocdn=1"
 
     pdf_file, url = pdf_cache_path(arxiv_id), arxiv_pdf_url(host, arxiv_id)
 
