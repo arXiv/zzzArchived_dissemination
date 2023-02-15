@@ -331,7 +331,7 @@ def sync_to_gcp(todo_q, host):
            retry=(retry_if_exception_type(EnsurePdfException)|retry_if_exception_type(requests.RequestException)),
            reraise=True)
     def tl_ensure_pdf(session, host, aid):
-        ensure_pdf(session, host, aid)
+        return ensure_pdf(session, host, aid)
         
     while RUN:
         start = perf_counter()
