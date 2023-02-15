@@ -40,6 +40,7 @@ requests==2.27.1
 rsa==4.9
 s3transfer==0.5.2
 six==1.16.0
+tenacity==8.2.1
 tomli==1.2.3
 typed-ast==1.5.4
 typing-extensions==4.1.1

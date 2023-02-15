@@ -42,11 +42,15 @@ from typing import List, Tuple
 
 from pathlib import Path
 
+from tenacity.wait import wait_exponential_jitter
+
 from identifier import Identifier
 
 overall_start = perf_counter()
 
 from google.cloud import storage
+
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_random_exponential
 
 import logging
 logging.basicConfig(level=logging.WARNING, format='%(message)s (%(threadName)s)')
@@ -66,12 +70,12 @@ ENSURE_HOSTS = [
     #('web2.arxiv.org', 40),
     #('web3.arxiv.org', 40),
     #('web4.arxiv.org', 40),
-    ('web5.arxiv.org', 4),
-    ('web6.arxiv.org', 4),
-    ('web7.arxiv.org', 4),
-    ('web8.arxiv.org', 4),
-    ('web9.arxiv.org', 4),
-    ('web10.arxiv.org', 4),
+    ('web5.arxiv.org', 3),
+    ('web6.arxiv.org', 3),
+    ('web7.arxiv.org', 3),
+    ('web8.arxiv.org', 3),
+    ('web9.arxiv.org', 3),
+    ('web10.arxiv.org', 3),
 ]
 """Tuples of form HOST, THREADS_FOR_HOST"""
 
@@ -80,6 +84,7 @@ ENSURE_CERT_VERIFY=False
 PDF_WAIT_SEC = 60 * 10
 """Maximum sec to wait for a PDF to be created"""
 
+# Thread safe queues
 todo_q: Queue = Queue()
 uploaded_q: Queue = Queue() # number of files uploaded
 summary_q: Queue = Queue()
@@ -95,6 +100,10 @@ def handler_stop_signals(signum, frame):
 signal.signal(signal.SIGINT, handler_stop_signals)
 signal.signal(signal.SIGTERM, handler_stop_signals)
 
+class EnsurePdfException(Exception):
+    """Indicate a problem during ensuring the PDF file exists"""
+    pass
+
 def ms_since(start:float) -> int:
     return int((perf_counter() - start) * 1000)
 
@@ -109,7 +118,7 @@ def make_todos(filename) -> List[dict]:
                      ('upload', '/cache/xyz/2202.00234.pdf')]
     """
 
-    # These regexs are more file focusec, they should do both legacy ids and modern ids
+    # These regexs should do both legacy ids and modern ids
     new_r = re.compile(r"^.* new submission\n.* paper_id: (.*)$", re.MULTILINE)
     abs_r = re.compile(r"^.* absfile: (.*)$", re.MULTILINE)
     src_pdf_r = re.compile(r"^.* Document source: (.*.pdf)$", re.MULTILINE)
@@ -228,7 +237,6 @@ def path_to_bucket_key(pdf) -> str:
     else:
         raise ValueError(f"Cannot convert PDF path {pdf} to a GS key")
 
-
 def ensure_pdf(session, host, arxiv_id):
     """Ensures PDF exits for arxiv_id.
 
@@ -258,26 +266,24 @@ def ensure_pdf(session, host, arxiv_id):
     start = perf_counter()
 
     if not pdf_file.exists():
-        start = perf_counter()
         headers = { 'User-Agent': ENSURE_UA }
         logger.debug("Getting %s", url)
         resp = session.get(url, headers=headers, stream=True, verify=ENSURE_CERT_VERIFY)
         [line for line in resp.iter_lines()]  # Consume resp in hopes of keeping alive session
         if resp.status_code != 200:
-            raise(Exception(f"ensure_pdf: GET status {resp.status_code} {url}"))
+            raise(EnsurePdfException(f"ensure_pdf: GET status {resp.status_code} {url}"))
+
         start_wait = perf_counter()
         while not pdf_file.exists():
             if perf_counter() - start_wait > PDF_WAIT_SEC:
-                raise(Exception(f"No PDF, waited longer than {PDF_WAIT_SEC} sec {url}"))
+                raise(EnsurePdfException(f"No PDF, waited longer than {PDF_WAIT_SEC} sec {url}"))
             else:
                 sleep(0.2)
         if pdf_file.exists():
-            logger.debug(f"ensure_file_url_exists: {str(pdf_file)} requested {url} status_code {resp.status_code} {ms_since(start)} ms")
             return (pdf_file, url, None, ms_since(start))
         else:
-            raise(Exception(f"ensure_pdf: Could not create {pdf_file}. {url} {ms_since(start)} ms"))
+            raise(EnsurePdfException(f"ensure_pdf: Could not create {pdf_file}. {url} waited {ms_since(start)} ms"))
     else:
-        logger.debug(f"ensure_file_url_exists: {str(pdf_file)} already exists")
         return (pdf_file, url, "already exists", ms_since(start))
 
 
@@ -305,7 +311,8 @@ def upload(gs_client, localpath, key):
     blob = bucket.get_blob(key)
     if blob is None or blob.size != localpath.stat().st_size:
         with open(localpath, 'rb') as fh:
-            bucket.blob(key).upload_from_file(fh, content_type=mime_from_fname(localpath))
+            rt = retry.Retry(deadline=120)
+            bucket.blob(key).upload_from_file(fh, content_type=mime_from_fname(localpath), retry=rt)
             logger.debug(f"upload: completed upload of {localpath} to gs://{GS_BUCKET}/{key} of size {localpath.stat().st_size}")
         return ("upload", localpath, key, "uploaded", ms_since(start), localpath.stat().st_size)
     else:
@@ -317,8 +324,15 @@ def upload(gs_client, localpath, key):
 def sync_to_gcp(todo_q, host):
     """Target for theads that gets jobs off of the todo queue and does job actions."""
     tl_data=threading.local()
-    tl_data.session,tl_data.gs_client = requests.Session(), storage.Client()
+    tl_data.session, tl_data.gs_client = requests.Session(), storage.Client()
 
+    @retry(stop=stop_after_attempt(3),
+           wait=wait_exponential_jitter(),
+           retry=(retry_if_exception_type(EnsurePdfException)|retry_if_exception_type(requests.RequestException)),
+           reraise=True)
+    def tl_ensure_pdf(session, host, aid):
+        ensure_pdf(session, host, aid)
+        
     while RUN:
         start = perf_counter()
         try:
@@ -337,7 +351,7 @@ def sync_to_gcp(todo_q, host):
             try:
                 res = ()
                 if action == 'build+upload':
-                    res = upload_pdf(tl_data.gs_client, ensure_pdf(tl_data.session, host, Identifier(item)))
+                    res = upload_pdf(tl_data.gs_client, tl_ensure_pdf(tl_data.session, host, Identifier(item)))
                 if action == 'upload':
                     res = upload(tl_data.gs_client, Path(item), path_to_bucket_key(item))
 
