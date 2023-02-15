@@ -279,6 +279,7 @@ def upload_thread_target(upload_q):
             logger.exception(f"Problem during {idv} {action} {localpath}")
             summary_q.put((idv, 'upload', 'failed', ms_since(start), str(ex)))
         upload_q.task_done()
+        sleep(UPLOAD_WAIT)
 
 
 # #################### MAIN #################### #
