@@ -45,6 +45,7 @@ from pathlib import Path
 from tenacity.wait import wait_exponential_jitter
 
 from identifier import Identifier
+from make_todos import make_todos
 
 overall_start = perf_counter()
 
@@ -55,14 +56,12 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_ra
 import logging
 logging.basicConfig(level=logging.WARNING, format='%(message)s (%(threadName)s)')
 logger = logging.getLogger(__file__)
-logger.setLevel(logging.WARNING)
+logger.setLevel(logging.WARN)
 
 GS_BUCKET= 'arxiv-production-data'
 GS_KEY_PREFIX = '/ps_cache'
 
 PS_CACHE_PREFIX= '/cache/ps_cache/'
-FTP_PREFIX = '/data/ftp/'
-ORIG_PREIFX = '/data/orig/'
 
 ENSURE_UA = 'periodic-rebuild'
 
@@ -84,10 +83,25 @@ ENSURE_CERT_VERIFY=False
 PDF_WAIT_SEC = 60 * 10
 """Maximum sec to wait for a PDF to be created"""
 
+UPLOAD_WAIT = 0.1
+UPLOAD_THREADS = 4
+UPLOAD_RETRYS=4
+
 # Thread safe queues
-todo_q: Queue = Queue()
-uploaded_q: Queue = Queue() # number of files uploaded
-summary_q: Queue = Queue()
+build_pdf_q: Queue = Queue() # queue for building pdfs
+upload_q: Queue = Queue() # queue of files to upload
+summary_q: Queue = Queue() # queue for reporting completed jobs
+
+def enqueue_todos(todos:List[Tuple])->None:
+    """Puts the todo work items in the correct queues"""
+    for item in todos:
+        action = item[3]
+        if action == 'upload':
+            upload_q.put(item)
+        elif action == 'build+upload':
+            build_pdf_q.put(item)
+        else:
+            logger.error(f"Skipping todo item with invalid action {item}")
 
 RUN = True
 DONE = False
@@ -106,124 +120,6 @@ class EnsurePdfException(Exception):
 
 def ms_since(start:float) -> int:
     return int((perf_counter() - start) * 1000)
-
-def make_todos(filename) -> List[dict]:
-    """Reades `filename` and figures out what work needs to be done for the sync.
-    This only uses data from the publish file.
-
-    It returns a list work to do as dicts like:
-
-        {'submission_id': 1234, 'paper_id': 2202.00234, 'type': 'new',
-         'actions': [('upload', '/some/dir/2202.00234.abs'),
-                     ('upload', '/cache/xyz/2202.00234.pdf')]
-    """
-
-    # These regexs should do both legacy ids and modern ids
-    new_r = re.compile(r"^.* new submission\n.* paper_id: (.*)$", re.MULTILINE)
-    abs_r = re.compile(r"^.* absfile: (.*)$", re.MULTILINE)
-    src_pdf_r = re.compile(r"^.* Document source: (.*.pdf)$", re.MULTILINE)
-    src_html_r = re.compile(r"^.* Document source: (.*.html.gz)$", re.MULTILINE)
-    src_tex_r = re.compile(r"^.* Document source: (.*.gz)$", re.MULTILINE)
-
-    rep_r = re.compile(r"^.* replacement for (.*)\n.*\n.* old version: (\d*)\n.* new version: (\d*)", re.MULTILINE)
-    wdr_r = re.compile(r"^.* withdrawal of (.*)\n.*\n.* old version: (\d*)\n.* new version: (\d*)", re.MULTILINE)
-    cross_r = re.compile(r"^.* cross for (.*)$")
-    cross_r = re.compile(r" cross for (.*)")
-    jref_r = re.compile(r" journal ref for (.*)")
-    test_r = re.compile(r" Test Submission\. Skipping\.")
-
-    todo = []
-
-    def upload_abs_acts(rawid):
-        """Makes upload actions for abs when only an id is available, ex cross or jref"""
-        arxiv_id = Identifier(rawid)
-        archive = ('arxiv' if not arxiv_id.is_old_id else arxiv_id.archive)
-        return [ ('upload', f"{FTP_PREFIX}/{archive}/papers/{arxiv_id.yymm}/{arxiv_id.filename}.abs")]
-
-    def upload_abs_src_acts(arxiv_id, txt):
-        """Makes upload actions for abs and source"""
-        absm = abs_r.search(txt)
-        pdfm = src_pdf_r.search(txt)
-        texm = src_tex_r.search(txt)
-        htmlm = src_html_r.search(txt)
-
-        actions:List[Tuple[str,str]] = []
-        if absm:
-             actions = [('upload', absm.group(1))]
-
-        if pdfm:
-            actions.append(('upload', pdfm.group(1)))
-        elif htmlm: #must be before tex due to pattern overlap
-            actions.append(('upload', htmlm.group(1)))
-        elif texm:
-            actions.append(('upload', texm.group(1)))
-            actions.append(('build+upload', f"{arxiv_id.id}v{arxiv_id.version}"))
-        else:
-            logger.error("Could not determin source for submission {arxiv_id}")
-
-        return actions
-
-    def rep_version_acts(txt):
-        """Makes actions for replacement.
-
-        Don't try to move on the GCP, just sync to GCP so it is idempotent."""
-        move_r = re.compile(r"^.* Moved (.*) => (.*)$", re.MULTILINE)
-        return [('upload', m.group(2)) for m in move_r.finditer(txt)]
-
-
-    sub_start_r = re.compile(r".* submission (\d*)$")
-    sub_end_r = re.compile(r".*Finished processing submission ")
-    subs, in_sub, txt, sm =[], False, '', None
-    with open(filename) as fh:
-        for line in fh.readlines():
-            if in_sub:
-                if sm is not None and sub_end_r.match(line):
-                    subs.append((sm.group(1), txt + line))
-                    txt, sm, in_sub = '', None, False
-                else:
-                    txt = txt + line
-            else:
-                sm = sub_start_r.match(line)
-                if sm:
-                    in_sub=True
-
-    for subid, txt in subs:
-        m = test_r.search(txt)
-        if m:
-             continue
-        m = new_r.search(txt)
-        if m:
-            arxiv_id = Identifier(f"{m.group(1)}v1")
-            todo.append({'submission_id': subid, 'paper_id': m.group(1), 'type': 'new',
-                        'actions': upload_abs_src_acts(arxiv_id, txt)})
-            continue
-        m = rep_r.search(txt)
-        if m:
-            arxiv_id = Identifier(f"{m.group(1)}v{m.group(3)}")
-            todo.append({'submission_id': subid, 'paper_id': m.group(1), 'type': 'rep',
-                        'actions': rep_version_acts(txt) + upload_abs_src_acts(arxiv_id, txt)})
-            continue
-        m = wdr_r.search(txt)
-        if m:
-            arxiv_id = Identifier(f"{m.group(1)}v{m.group(3)}")
-            # withdrawls don't need the pdf synced since they should lack source
-            actions = list(filter(lambda tt: tt[0] != 'build+upload', rep_version_acts(txt) + upload_abs_src_acts(arxiv_id, txt)))
-            todo.append({'submission_id': subid, 'paper_id': m.group(1), 'type': 'wdr',
-                        'actions': actions})
-            continue
-        m = cross_r.search(txt)
-        if m:
-            todo.append({'submission_id': subid, 'paper_id': m.group(1), 'type': 'cross',
-                        'actions': upload_abs_acts(m.group(1))})
-            continue
-        m = jref_r.search(txt)
-        if m:
-            todo.append({'submission_id': subid, 'paper_id': m.group(1), 'type': 'jref',
-                        'actions': upload_abs_acts(m.group(1))})
-            continue
-
-    return todo
-
 
 
 def path_to_bucket_key(pdf) -> str:
@@ -287,13 +183,48 @@ def ensure_pdf(session, host, arxiv_id):
         return (pdf_file, url, "already exists", ms_since(start))
 
 
-def upload_pdf(gs_client, ensure_tuple):
-    """Uploads a PDF from ps_cache to GS_BUCKET"""
-    return upload(gs_client, ensure_tuple[0], path_to_bucket_key(ensure_tuple[0])) + ensure_tuple
+def ensure_pdf_build_thread_target(build_q, host):
+    """Target for theads that gets jobs off of the queue and ensures the PDF is built."""
+    tl_data=threading.local()
+    tl_data.session = requests.Session()
+
+    @retry(stop=stop_after_attempt(3),
+           wait=wait_exponential_jitter(),
+           retry=(retry_if_exception_type(EnsurePdfException)|retry_if_exception_type(requests.RequestException)),
+           reraise=True)
+    def tl_ensure_pdf(session, host, aid):
+        return ensure_pdf(session, host, aid)
+
+    while RUN:
+        start = perf_counter()
+        try:
+            job = build_q.get(block=False)
+            if not job or not type(job) == tuple or not len(job)==5:
+                logger.error("build_q.get() returned invalid {job}")
+                continue
+            subid, subtype, idv, action, item = job
+            if action != 'build+upload':
+                logger.warning("unexpected {action} job for ensure_pdf_build_thread_target")
+        except Empty:  # queue is empty and thread is done
+            break
+
+        try:
+            #logger.debug("doing pdf build for %s", idv)
+            pdf_file, url, status, duration = tl_ensure_pdf(tl_data.session, host, Identifier(item))
+            summary_q.put((idv, 'ensure_pdf',status, ms_since(start), url))
+            #logger.debug("pdf built for %s", idv)
+            upload_q.put( (subid, subtype, idv, 'upload', pdf_file) )
+            #logger.debug("enqueued for upload %s", idv)
+        except Exception as ex:
+            logger.exception(f"Problem during {idv} {action} {item}")
+            summary_q.put((idv, 'ensure_pdf', 'failed',  ms_since(start), str(ex)))
+        build_q.task_done()
 
 
-def upload(gs_client, localpath, key):
-    """Upload a file to GS_BUCKET"""
+
+def upload_thread_target(upload_q):
+    tl_data=threading.local()
+    tl_data.gs_client = storage.Client()
 
     def mime_from_fname(filepath):
         if filepath.suffix == '.pdf':
@@ -305,61 +236,49 @@ def upload(gs_client, localpath, key):
         else:
             return ''
 
-    start = perf_counter()
+    def upload_pdf(gs_client, ensure_tuple):
+        """Uploads a PDF from ps_cache to GS_BUCKET"""
+        return upload(gs_client, ensure_tuple[0], path_to_bucket_key(ensure_tuple[0])) + ensure_tuple
 
-    bucket = gs_client.bucket(GS_BUCKET)
-    blob = bucket.get_blob(key)
-    if blob is None or blob.size != localpath.stat().st_size:
-        with open(localpath, 'rb') as fh:
-            rt = retry.Retry(deadline=120)
-            bucket.blob(key).upload_from_file(fh, content_type=mime_from_fname(localpath), retry=rt)
-            logger.debug(f"upload: completed upload of {localpath} to gs://{GS_BUCKET}/{key} of size {localpath.stat().st_size}")
-        return ("upload", localpath, key, "uploaded", ms_since(start), localpath.stat().st_size)
-    else:
-        logger.debug(f"upload: Not uploading {localpath}, gs://{GS_BUCKET}/{key} already on gs")
-        return ("upload", localpath, key, "already_on_gs", ms_since(start), 0)
-
-
-
-def sync_to_gcp(todo_q, host):
-    """Target for theads that gets jobs off of the todo queue and does job actions."""
-    tl_data=threading.local()
-    tl_data.session, tl_data.gs_client = requests.Session(), storage.Client()
-
-    @retry(stop=stop_after_attempt(3),
+    @retry(stop=stop_after_attempt(UPLOAD_RETRYS),
            wait=wait_exponential_jitter(),
-           retry=(retry_if_exception_type(EnsurePdfException)|retry_if_exception_type(requests.RequestException)),
            reraise=True)
-    def tl_ensure_pdf(session, host, aid):
-        return ensure_pdf(session, host, aid)
-        
+    def upload(gs_client, localpath, key):
+        """Upload a file to GS_BUCKET."""
+
+        bucket = gs_client.bucket(GS_BUCKET)
+        blob = bucket.get_blob(key)
+        if blob is None or blob.size != localpath.stat().st_size:
+            with open(localpath, 'rb') as fh:
+                bucket.blob(key).upload_from_file(fh, content_type=mime_from_fname(localpath))
+                logger.debug(f"upload: completed upload of {localpath} to gs://{GS_BUCKET}/{key} of size {localpath.stat().st_size}")
+            return ("uploaded", localpath.stat().st_size)
+        else:
+            logger.debug(f"upload: Not uploading {localpath}, gs://{GS_BUCKET}/{key} already on gs")
+            return ("already_on_gs", 0)
+
     while RUN:
         start = perf_counter()
         try:
-            job = todo_q.get(block=False)
-            if not job:
-                logger.error("todo_q.get() returned {job}")
+            job = upload_q.get(block=False)
+            if not job or not type(job) == tuple or not len(job)==5:
+                logger.error("upload_q.get() returned invalid {job}")
                 continue
-            if not job.get('paper_id',None):
-                logger.error("todo_q.get() job lacked paper_id, skipping")
-                continue
+            subid, subtype, idv, action, localpath = job
+            if action != 'upload':
+                logger.warning("unexpected {action} job for upload_thread_target")
         except Empty:  # queue is empty and thread is done
             break
 
-        logger.debug("doing %s", job['paper_id'])
-        for action, item in job['actions']:
-            try:
-                res = ()
-                if action == 'build+upload':
-                    res = upload_pdf(tl_data.gs_client, tl_ensure_pdf(tl_data.session, host, Identifier(item)))
-                if action == 'upload':
-                    res = upload(tl_data.gs_client, Path(item), path_to_bucket_key(item))
-
-                summary_q.put((job['paper_id'], ms_since(start)) + res)
-            except Exception as ex:
-                logger.exception(f"Problem during {job['paper_id']} {action} {item}")
-                summary_q.put((job['paper_id'], ms_since(start), "failed", str(ex)))
-        todo_q.task_done()
+        try:
+            logger.debug("uploading for %s", idv)
+            gsurl = path_to_bucket_key(localpath)
+            status, size = upload(tl_data.gs_client, Path(localpath), gsurl)
+            summary_q.put((idv, 'upload', status, ms_since(start), f"gs://{GS_BUCKET}/{gsurl}", size))
+        except Exception as ex:
+            logger.exception(f"Problem during {idv} {action} {localpath}")
+            summary_q.put((idv, 'upload', 'failed', ms_since(start), str(ex)))
+        upload_q.task_done()
 
 
 # #################### MAIN #################### #
@@ -375,42 +294,51 @@ if __name__ == "__main__":
     if args.v:
         logger.setLevel(logging.INFO)
 
-    logger.info(f"Starting at {datetime.now().isoformat()}")
+    print(f"Starting at {datetime.now().isoformat()}")
+    todo = make_todos(args.filename)
 
-    [todo_q.put(item) for item in make_todos(args.filename)]
-
+    sub_count = len(set([item[0] for item in todo]))
     if args.d:
-        todo =  list(todo_q.queue)
         print(json.dumps(todo, indent=2))
-        print(f"{len(todo)} submissions (some may be test submissions)")
+        print(f"{sub_count} submissions (some may be test submissions)")
         logger.info("Dry run no changes made")
         sys.exit(1)
 
-    logger.debug("made todo_q, getting size")
-    overall_size = todo_q.qsize()
-    logger.debug('Made %d todos', overall_size)
-
-    threads = []
+    enqueue_todos(todo)
+    pdf_threads = []
     for host, n_th in ENSURE_HOSTS:
-        ths = [Thread(target=sync_to_gcp, args=(todo_q, host)) for _ in range(0, n_th)]
-        threads.extend(ths)
+        ths = [Thread(target=ensure_pdf_build_thread_target, args=(build_pdf_q, host)) for _ in range(0, n_th)]
+        pdf_threads.extend(ths)
         [t.start() for t in ths]
 
-    logger.debug("started %d threads", len(threads))
+    logger.debug("started %d pdf threads", len(pdf_threads))
 
-    while RUN and not todo_q.empty():
+    upload_threads = []
+    for i in range(0,UPLOAD_THREADS):
+        th = Thread(target=upload_thread_target, args=(upload_q,))
+        th.start()
+        upload_threads.append(th)
+
+    logger.debug("started %d upload threads", len(pdf_threads))
+
+    while RUN and not build_pdf_q.empty():
         sleep(0.2)
 
-    logger.debug("todo_q is now empty")
+    logger.debug("build_pdf_q is now empty")
+
+    while RUN and not upload_q.empty():
+        sleep(0.2)
+
+    logger.debug("uplaod_q is now empty")
 
     DONE=True
     RUN=False
     logger.debug("wating to join threads")
-    [th.join() for th in threads]
+    [th.join() for th in pdf_threads + upload_threads]
     logger.debug("Threads done joining")
 
     for row in sorted(list(summary_q.queue), key=lambda tup: tup[0]):
-        print(','.join(map(str, row)))
+         print(','.join(map(str, row)))
 
     print(f"Done at {datetime.now().isoformat()}")
-    print(f"Overall time: {(perf_counter()-overall_start):.2f} sec for {overall_size} submissions")
+    print(f"Overall time: {(perf_counter()-overall_start):.2f} sec for {sub_count} submissions")
